@@ -1,0 +1,1388 @@
+---
+title: "Credit Default Risk"
+output: html_document
+---
+
+
+
+```{r}
+
+library(tidyverse)
+library(skimr)
+library(sqldf)
+library(recipes)
+
+train <- read_csv("application_train.csv")
+test  <- read_csv("application_test.csv")
+
+```
+
+
+
+```{r}
+
+bureau <- read.csv('bureau.csv')
+bureau_balance <- read.csv('bureau_balance.csv')
+credit_card_balance <- read.csv('credit_card_balance.csv')
+columns_description <- read.csv('HomeCredit_columns_description.csv')
+installments_payments <- read.csv('installments_payments.csv')
+pos_cash <- read.csv('POS_CASH_balance.csv')
+previous_app <- read.csv('previous_application.csv')
+sample_submit <- read.csv('sample_submission.csv')
+
+```
+
+
+```{r}
+
+skim_to_list(train)
+
+```
+
+
+Let's examine the percentage of missing values in the data. 
+We will remove columns that have more than 50% NA values. 
+These columns are not as useful and when we impute, we prefer to do minimal imputation.
+
+```{r}
+
+options(scipen = 999)
+
+train <- train[,apply(train, 2, function(x){(sum(is.na(x)) / nrow(train)) < 0.5}) != FALSE] 
+
+temp <- train
+
+lapply(temp, function(x) mean(is.na(x)))
+
+
+```
+
+
+Now, we will prepare to make character columns into factor columns.
+We will also make numeric columns that have a low number of unique values into factor columns (or categorical) columns.
+
+
+```{r}
+
+string_2_factor_names <- temp %>%
+    select_if(is.character) %>%
+    names()
+
+string_2_factor_names
+
+
+```
+
+
+
+```{r}
+
+unique_numeric_values_tbl <- temp %>%
+    select_if(is.numeric) %>%
+    map_df(~ unique(.) %>% length()) %>%
+    gather() %>%
+    arrange(value) %>%
+    mutate(key = as_factor(key))
+
+unique_numeric_values_tbl
+
+
+```
+
+
+We will use 7 as a threshold. Columns that have less than 7 unique values will be turned into categorical columns.
+
+
+```{r}
+
+factor_limit <- 7
+
+num_2_factor_names <- unique_numeric_values_tbl %>%
+    filter(value < factor_limit) %>%
+    arrange(desc(value)) %>%
+    pull(key) %>%
+    as.character()
+
+num_2_factor_names
+
+
+```
+
+
+
+```{r}
+
+rec_obj <- recipe(~ ., data = temp) %>%
+    step_string2factor(string_2_factor_names) %>%
+    step_num2factor(num_2_factor_names) %>%
+    prep(stringsAsFactors = FALSE)
+
+rec_obj
+
+
+```
+
+
+
+
+```{r}
+
+temp_processed <- bake(rec_obj, temp) 
+
+head(temp_processed)
+
+```
+
+
+Checking to see if data processing worked correctly
+
+
+```{r}
+
+class(temp$FLAG_PHONE) #this was originally numeric
+class(temp_processed$FLAG_PHONE) #now it is a factor
+
+class(temp$REG_CITY_NOT_LIVE_CITY) #this was originally numeric
+class(temp_processed$REG_CITY_NOT_LIVE_CITY) #now it is a factor
+
+class(temp$TARGET) #this was originally numeric
+class(temp_processed$TARGET) #now it is a factor
+
+```
+
+
+Let's recap. We have temp_processed which includes columns with less than 50% NA's only.
+We also converted character columns into factor columns.
+We also concerted certain numeric columns into factor (categorical) columns due to low number of unique values.
+
+
+#Exploratory Data Analysis
+
+
+Now, we will conduct EDA with SQL and other tools.
+
+We will take a look at certain columns of interest.
+
+
+##AMT_CREDIT (loan amount)
+
+```{r}
+
+summary(temp_processed$AMT_CREDIT)
+
+ggplot(data = temp_processed, aes(x = AMT_CREDIT)) + 
+  geom_histogram(aes(y = ..count..), binwidth = 1.75 * IQR(temp_processed$AMT_CREDIT) / nrow(temp_processed)^(1/3.5) , fill = 'red')+
+  labs(title='Credit Amount Distribution')+
+  labs(x='Credit Amount',y = 'Frequency') + 
+  theme(plot.title = element_text(hjust = 0.5)) 
+
+
+```
+
+
+The mean is roughly 600,000.
+
+
+##Relationship between Gender and Default Rate
+
+```{r}
+
+male <- subset(temp_processed, CODE_GENDER == 'M')
+female <- subset(temp_processed, CODE_GENDER == 'F')
+
+male_prop <- mean(male$TARGET == '1') #0.10
+female_prop <- mean(female$TARGET == '1') #0.70
+
+male_default <- sum(male$TARGET == '1')
+female_default <- sum(female$TARGET == '1')
+
+
+res <- prop.test(x = c(male_default, female_default), n = c(nrow(male), nrow(female)))
+res 
+
+```
+
+
+Our result is significant, but since our data is so huge it's probably a good idea to take a look at effect size.
+
+
+Effect size is represented as h.
+
+
+$$ h = \phi_{1} - \phi_{2} $$
+
+Where:
+
+
+$$ \phi_{i} = 2sin^{-1}(\sqrt{p_{i}}) $$
+
+```{r}
+
+effect_size_2prop <- function(prop1, prop2){
+  
+  return((2 * asin(sqrt(prop1))) - (2 * asin(sqrt(prop2))))
+  
+}
+
+effect_size_2prop(male_prop, female_prop)
+
+
+```
+
+
+According to our effect size, there does not seem to be a significant difference. However, let's keep gender in mind
+when we start constructing our predictive model since the difference in default risk is a little over 0.03.
+
+
+
+##Owning a Car or Home and Default Rate
+
+We can assume that those who do not own a car or a home/flat are renting one.
+It could be true that those who are paying monthly bills for their home and car might have a harder time paying back
+other loans. Let's see if this is the case.
+
+```{r}
+
+renting_home_car <- sqldf("SELECT FLAG_OWN_REALTY, FLAG_OWN_CAR, AVG(TARGET) AS default_rate
+                           FROM temp_processed
+                           GROUP BY FLAG_OWN_REALTY, FLAG_OWN_CAR
+                           ORDER BY AVG(TARGET)")
+
+renting_home_car
+
+```
+
+We found that our claim has some truth to it. Those who are renting both a home and leasing a car have a slightly higher
+default rate. However if we think about it, this difference in default rate is actually quite big. 
+
+Default rates typically would not be that high across different categories. In most situations, the default rate would hover around 10%. Therefore, a small difference of 1 or 2% can be considered significant.
+
+In our case, the difference in default rate between YY and NN is 1.66%
+
+
+##Income and Default Rate
+
+```{r}
+
+quantile(temp_processed$AMT_INCOME_TOTAL, probs = c(0, 0.25, 0.50, 0.75,1))
+
+income_default <- sqldf("SELECT CASE WHEN AMT_INCOME_TOTAL <= 147150 THEN 'LOW'
+                                     WHEN AMT_INCOME_TOTAL > 147150 THEN 'HIGH'
+                                    
+                                END AS 'Income_Level',
+
+                         AVG(TARGET) AS default_rate
+                         FROM temp_processed
+                         GROUP BY Income_Level
+                         ORDER BY default_rate DESC")
+
+income_default
+
+```
+
+
+It seems that income level with 2 classes could explain/predict default rate fairly well. We see that the difference in default rate between low and high income is 0.74% which could be significant.
+
+
+##Number of Children and Default Rate
+
+```{r}
+
+table(temp_processed$CNT_CHILDREN)
+
+
+childrencount_default <- sqldf("SELECT CASE WHEN CNT_CHILDREN = 0 THEN 'NO CHILDREN'
+                                            WHEN CNT_CHILDREN IN (1,2) THEN 'HAS CHILDREN'
+                                            ELSE 'MANY CHILDREN' END AS 'Number_of_Children',
+                                AVG(TARGET) AS default_rate
+                                FROM temp_processed
+                                GROUP BY Number_of_Children
+                                ORDER BY default_rate")
+
+
+childrencount_default
+
+```
+
+The decision to group CNT_CHILDREN into the 3 categories is based on the fact that
+there are not many clients who have a high number of children such as 10, 14, or 19.
+
+In fact, there are only 3 clients who have 14 children and only 2 who have 19 children.
+Since the expected default rate is already very low and we have low counts, we got 0% for default.
+This would make it seem as if people with many children have a low default rate which likely is not the case.
+
+Therefore, I have grouped 1 or 2 children as "HAS CHILDREN", more than 2 children as "MANY CHILDREN" and 0 as "NO CHILDREN".
+
+From the SQL query we notice that there is a huge difference in default rate (2.3%) between "NO CHILDREN" and "MANY CHILDREN".
+
+Clients that have to spend a huge amount of money on many children would be more likely to default because
+they have extra expenses they need to worry about.
+
+
+
+##Type of Loan and Default Rate
+
+
+There are 2 types of loans in our data. One of them is a cash loan and the other one is a revolving loan.
+
+Revolving loans are loans in which the client can withdraw, repay, and withdraw again
+usually an unlimited number of times (unless they go over their limit). When we think of revolving loans, we usually think of credit cards since they behave this way.
+
+A cash loan is like a "one-time" loan such as a loan to buy a house, car, or something else.
+
+
+```{r}
+
+table(temp_processed$NAME_CONTRACT_TYPE)
+
+mean(temp_processed$NAME_CONTRACT_TYPE == 'Cash loans')
+
+
+t <- table(temp_processed$NAME_CONTRACT_TYPE); barplot(t/sum(t)*100,ylab="Per cent", col = 'green')
+
+```
+
+We see that 90.5% of loans from Home Credit are cash loans.
+
+Would the default rate be significantly differ depending on which loan the client takes out? Let's find out.
+
+
+```{r}
+
+sqldf("SELECT NAME_CONTRACT_TYPE, AVG(TARGET) AS default_rate
+       FROM temp_processed
+       GROUP BY NAME_CONTRACT_TYPE
+       ORDER BY default_rate ")
+
+
+sqldf("SELECT NAME_CONTRACT_TYPE, AVG(AMT_CREDIT) AS loan_amount
+       FROM temp_processed
+       GROUP BY NAME_CONTRACT_TYPE
+       ORDER BY loan_amount")
+
+```
+
+
+We definately notice that the difference in default rate is huge between the 2 types of loans. The difference is 2.83%
+This will likely be a very significant predictor when we make our model.
+
+
+
+##Age of Client
+
+
+The age of client is represented in days at the time of the application.
+
+To make the this column more interpretable and understandable for us, it's probably a better idea to divide by 365.
+
+```{r}
+
+temp_processed$DAYS_BIRTH <- (-1) * (temp_processed$DAYS_BIRTH / 365)
+
+summary(temp_processed$DAYS_BIRTH)
+
+
+```
+
+
+```{r}
+
+ggplot(data = temp_processed, aes(x = DAYS_BIRTH)) + 
+  geom_histogram(aes(y = ..count..), binwidth = 1.5 * IQR(temp_processed$DAYS_BIRTH) / nrow(temp_processed)^(1/3) , fill = 'blue')+
+  labs(title='Age Distribution')+
+  labs(x='Age',y = 'Frequency') + 
+  theme(plot.title = element_text(hjust = 0.6)) 
+
+```
+
+We see that the distribution of age seems rather uniform, expect that it dips down at the sides.
+This makes sense since people in their early 20's would likely still be in college and so they would not need to take
+out too many loans. People in their late 60's are likely retired and like students, would probably not be taking out loans at that point in their life.
+
+
+
+##Examination of Other Categorical Features
+
+
+###Occupation Type Distribution
+
+
+```{r  out.width = '80%'}
+knitr::include_graphics('occupation_dist.jpg')
+```
+
+
+I decided to use Tableau for making this visualization. This visualization was based on a random sample of the data.
+Tableau won't be able to handle such large data, and I figured a sample size of 3000 would be representative of the population distribution.
+
+We see that an overwhelming majority of clients come from the following categories:
+
+Laborers, Sales Staff, Core Staff, Drivers, Managers, High Skill Tech Staff
+
+
+
+###Previous Application: Status of Previous Application
+
+
+```{r}
+
+prev_app_status <- as.data.frame(table(previous_app$NAME_CONTRACT_STATUS))
+
+colnames(prev_app_status) <- c('Status', 'Frequecy')
+
+prev_app_status
+
+dat = data.frame(count = c(1036781, 316319,290678,26436), category = c('Approved', 'Canceled', 'Refused', 'Unused Offer'))
+ 
+dat$fraction = dat$count / sum(dat$count)
+dat = dat[order(dat$fraction), ]
+dat$ymax = cumsum(dat$fraction)
+dat$ymin = c(0, head(dat$ymax, n=-1))
+ 
+dat
+
+# Make the plot
+p1 = ggplot(dat, aes(fill=category, ymax=ymax, ymin=ymin, xmax=4, xmin=3)) +
+     geom_rect() +
+     coord_polar(theta="y") +
+     xlim(c(0, 4)) +
+     theme(panel.grid=element_blank()) +
+     theme(axis.text=element_blank()) +
+     theme(axis.ticks=element_blank()) +
+     annotate("text", x = 0, y = 0, label = "Previous Application Status") +
+     labs(title="")
+p1
+
+
+```
+
+
+Here we notice that approximately 17.4% of previous applications were rejected. This could be an important feature in our model. We can use information about whether or not a previous application was rejected or not (0 or 1, binary) to determine the likelihood of the current loan being defaulted. 'Canceled' could also give some insight. If somebody cancels their loan application, the likelihood of that person being financially instable might be higher because they realized they cannot afford to pay back the loan.
+
+
+#Feature Engineering
+
+
+##Adding 'Expected Age of Full Repayment' feature (feature combines Age, AMT_ANNUITY, AMT_CREDIT)
+
+```{r}
+
+summary(temp_processed$AMT_CREDIT / temp_processed$AMT_ANNUITY)
+
+#for instance, if result is 0.05 then we are paying 5% of the loan back.
+#assuming annuity payed every 30 days (or 1 month)
+
+#then, 20 months to pay back loan in full
+
+temp_processed$DAYS_BIRTH <- (-1) * temp_processed$DAYS_BIRTH * 365
+
+
+```
+
+
+```{r}
+
+duration_to_pay <- temp_processed$AMT_CREDIT / temp_processed$AMT_ANNUITY
+
+temp_processed$age_repay_estimate <- ((-1) * temp_processed$DAYS_BIRTH) + (duration_to_pay * 30)
+
+```
+
+
+
+##Updating CNT_CHILDREN Feature
+
+
+```{r}
+
+temp_processed <- sqldf("SELECT temp_processed.*,
+                                
+                                            CASE WHEN CNT_CHILDREN = 0 THEN 'NO CHILDREN'
+                                            WHEN CNT_CHILDREN IN (1,2) THEN 'HAS CHILDREN'
+                                            ELSE 'MANY CHILDREN' END AS 'Number_of_Children'
+
+
+                         FROM temp_processed
+                        
+                        
+                        
+                        ")
+
+temp_processed$CNT_CHILDREN <- NULL
+
+
+
+```
+
+
+##Updating CNT_FAM_MEMBERS
+
+```{r}
+
+familycount_default <- sqldf("SELECT CASE WHEN CNT_FAM_MEMBERS > 4 THEN 'HAS MANY FAMILY MEMBERS'
+                                     ELSE 'HAS FAMILY MEMBERS' END AS 'Number_of_Family_Members',
+                                AVG(TARGET) AS default_rate
+                                FROM temp_processed
+                                GROUP BY Number_of_Family_Members
+                                ORDER BY default_rate")
+
+
+
+familycount_default
+
+
+```
+
+```{r}
+
+
+temp_processed <- sqldf("SELECT temp_processed.*,
+                                
+                                     CASE WHEN CNT_FAM_MEMBERS > 4 THEN 'HAS MANY FAMILY MEMBERS'
+                                     ELSE 'HAS FAMILY MEMBERS' END AS 'Number_of_Family_Members'
+
+
+                         FROM temp_processed
+                        
+                        
+                        
+                        ")
+
+
+
+temp_processed$CNT_FAM_MEMBERS <- NULL
+
+```
+
+
+
+```{r}
+
+library(caTools)
+library(randomForest)
+set.seed(7720489)
+
+temp_processed$NAME_TYPE_SUITE <- as.factor(temp_processed$NAME_TYPE_SUITE)
+temp_processed$OCCUPATION_TYPE <- as.factor(temp_processed$OCCUPATION_TYPE)
+temp_processed$EMERGENCYSTATE_MODE <- as.factor(temp_processed$EMERGENCYSTATE_MODE)
+temp_processed$AMT_REQ_CREDIT_BUREAU_HOUR <- as.factor(temp_processed$AMT_REQ_CREDIT_BUREAU_HOUR)
+temp_processed$Number_of_Children <- as.factor(temp_processed$Number_of_Children)
+temp_processed$Number_of_Family_Members <- as.factor(temp_processed$Number_of_Family_Members)
+
+
+
+
+```
+
+
+#Updating Categorical Columns
+
+We must change categorical columns with many levels into numeric. Earlier we cleaned numeric data with only several unique values by turning them into categoricals, but not the other way around. We need to do this in order for random forest to run successfully.
+
+
+```{r}
+
+unique_categorical_levels_tbl <- temp_processed %>%
+    select_if(is.factor) %>%
+    map_df(~ unique(.) %>% length()) %>%
+    gather() %>%
+    arrange(value) %>%
+    mutate(key = as_factor(key))
+
+unique_categorical_levels_tbl
+
+
+```
+
+
+The column that prevents us from running random forest successfully is ORGANIZATION_TYPE.
+
+There are several approaches we can take to solve this issue. One option is to just not use that column when running random forest, and the other option is to collapse the number of levels manually by doing some grouping.
+
+
+```{r}
+
+organization <- sqldf("SELECT ORGANIZATION_TYPE, COUNT(*) AS count, AVG(TARGET) AS default_rate
+       FROM temp_processed
+       GROUP BY ORGANIZATION_TYPE
+       ORDER BY default_rate DESC")
+
+organization
+
+
+```
+
+
+It seems that ORGANIZATION_TYPE has some potential in being a useful predictor for defaulting. We notice that some levels such as "resturaunt" have a very high default rate whereas "police" has a low default rate.
+
+Something interesting that we notice is that "military", "police", "university", and "security ministries" have very low default rates. This could be because they are public sector jobs and these clients might be more loyal and obedient, and so are more likely to pay their loans on time.
+
+
+Let's try to group our levels a bit. Let's group all the "type X" levels into their respective level.
+For instance, Industry: type 13 and Industry: type 8 will be grouped into just "Industry" and so on.
+
+
+```{r}
+
+library(forcats)
+library(rockchalk)
+
+
+temp_processed$ORGANIZATION_TYPE <- combineLevels(temp_processed$ORGANIZATION_TYPE, 
+              
+              levs = c("Industry: type 1","Industry: type 2", 'Industry: type 3', 'Industry: type 4', 'Industry: type 5',
+               'Industry: type 6', 'Industry: type 7', 'Industry: type 8', 'Industry: type 9', 'Industry: type 10',
+               'Industry: type 11', 'Industry: type 12', 'Industry: type 13'), 
+              
+              newLabel = c("Industry"))
+
+temp_processed$ORGANIZATION_TYPE <- combineLevels(temp_processed$ORGANIZATION_TYPE, 
+              
+              levs = c('Transport: type 1', 'Transport: type 2', 'Transport: type 3', 'Transport: type 4'),
+              
+              newLabel = c("Transport"))
+
+
+temp_processed$ORGANIZATION_TYPE <- combineLevels(temp_processed$ORGANIZATION_TYPE, 
+               
+               levs = c('Trade: type 1', 'Trade: type 2', 'Trade: type 3', 'Trade: type 4', 'Trade: type 5',
+             'Trade: type 6', 'Trade: type 7'),
+               
+               newLabel = c("Trade"))
+
+
+temp_processed$ORGANIZATION_TYPE <- combineLevels(temp_processed$ORGANIZATION_TYPE, 
+              
+              levs = c('Business Entity Type 1', 'Business Entity Type 2', 'Business Entity Type 3'),
+              
+              newLabel = c("Business Entity"))
+
+
+```
+
+
+
+Now that we have collapsed levels, let's just check to make sure it indeed worked.
+
+
+
+```{r}
+
+organization <- sqldf("SELECT ORGANIZATION_TYPE, COUNT(*) AS count, AVG(TARGET) AS default_rate
+       FROM temp_processed
+       GROUP BY ORGANIZATION_TYPE
+       ORDER BY default_rate DESC")
+
+organization
+
+```
+
+
+
+#Modeling
+
+
+Random Forest should work properly now. Let's create train and test sets.
+
+We will do an 0.80/0.20 split meaning that 80% of our data is in the training set and 20% is used for the test set.
+
+However, first we must initially subset the data since our dataset currently is very huge. Machine learning algorithms take a long time to run and R will not be able to handle such huge data. Therefore, we will first take a random sample.
+
+```{r}
+require(caTools)
+
+set.seed(7720489)
+
+random_rows <- sample(nrow(temp_processed), 3000)
+
+temp_processed_subset <- temp_processed[random_rows, ]
+
+temp_processed_subset$SK_ID_CURR <- NULL #this is not a predictor. it is just an ID.
+
+temp_processed_subset$AMT_ANNUITY <- NULL #age of repay includes this predictor already
+
+temp_processed_subset$AMT_CREDIT <- NULL #age of repay includes this predictor already
+
+temp_processed_subset$EXT_SOURCE_2 <- NULL #we don't know how to interpret this column
+
+temp_processed_subset$EXT_SOURCE_3 <- NULL #we don't know how to interpret this column
+
+sample <- sample.split(temp_processed_subset, SplitRatio = 0.8) 
+
+temp_processed_subset.train <- subset(temp_processed_subset,sample == TRUE)
+
+temp_processed_subset.test <- subset(temp_processed_subset, sample == FALSE)
+
+set.seed(7720489)
+
+mybag <- randomForest(TARGET ~ ., data = temp_processed_subset.train, na.action = na.roughfix, importance = TRUE)
+
+predicted_stuff <- predict(mybag, newdata = temp_processed_subset.test) 
+
+table(predicted = predicted_stuff, actual = temp_processed_subset.test$TARGET)
+
+#Get importance of features with Gini Index 
+imp <- as.data.frame(importance(mybag))
+imp["feature"] <- rownames(imp)
+imp <- imp[,c("feature","MeanDecreaseGini")]
+sqldf::sqldf("SELECT * FROM imp ORDER BY MeanDecreaseGini DESC")
+
+```
+
+Using all predictors, we already have a low error or misclassification rate! It is 7.45%
+In other words, our accuracy is 92.55% already.
+
+
+```{r}
+
+require(caTools)
+
+set.seed(100)
+
+random_seeds <- sample(seq(1,1000000000), 50)
+
+error_rates <- rep(NA, length(random_seeds))
+
+
+for(i in 1:length(random_seeds)){
+
+set.seed(random_seeds[i])
+  
+random_rows <- sample(nrow(temp_processed), 3000)
+
+temp_processed_subset <- temp_processed[random_rows, ]
+
+temp_processed_subset$SK_ID_CURR <- NULL #this is not a predictor. it is just an ID.
+
+temp_processed_subset$AMT_ANNUITY <- NULL #age of repay includes this predictor already
+
+temp_processed_subset$AMT_CREDIT <- NULL #age of repay includes this predictor already
+
+temp_processed_subset$EXT_SOURCE_2 <- NULL #we don't know how to interpret this column
+
+temp_processed_subset$EXT_SOURCE_3 <- NULL #we don't know how to interpret this column
+
+set.seed(random_seeds[i])
+
+sample <- sample.split(temp_processed_subset, SplitRatio = 0.8) 
+
+temp_processed_subset.train <- subset(temp_processed_subset,sample == TRUE)
+
+temp_processed_subset.test <- subset(temp_processed_subset, sample == FALSE)
+
+set.seed(random_seeds[i])
+
+mybag <- randomForest(TARGET ~ ., data = temp_processed_subset.train, na.action = na.roughfix, importance = TRUE)
+
+predicted_stuff <- predict(mybag, newdata = temp_processed_subset.test) 
+
+error_rates[i] <- (table(predicted = predicted_stuff, actual = temp_processed_subset.test$TARGET)[2] + table(predicted = predicted_stuff, actual = temp_processed_subset.test$TARGET)[3]) / (table(predicted = predicted_stuff, actual = temp_processed_subset.test$TARGET)[1] + table(predicted = predicted_stuff, actual = temp_processed_subset.test$TARGET)[4] + table(predicted = predicted_stuff, actual = temp_processed_subset.test$TARGET)[2] + table(predicted = predicted_stuff, actual = temp_processed_subset.test$TARGET)[3])
+
+
+}
+
+summary(error_rates)
+sd(error_rates)
+
+hist(error_rates, main = "Misclassification Rate Distribution", col = "red")
+
+
+```
+
+
+
+#More Feature Engineering
+
+##Previous Application Status as a Predictor
+
+Let's try to see if we can increase the accuracy of our model by adding another important feature: previous application status. We can join this table on the training data (temp_processed).
+
+
+The name of this column is NAME_CONTRACT_STATUS.
+
+SK_ID_CURR is the current loan ID (in temp_processed).
+SK_ID_PREV is the loan ID of the previous application
+
+
+```{r}
+
+length(which(temp_processed$SK_ID_CURR %in% previous_app$SK_ID_CURR == FALSE)) / nrow(temp_processed) * 100
+
+mean(is.na(previous_app$NAME_CONTRACT_STATUS))
+
+```
+
+We notice that 5.35% of clients do NOT have a previous application. 
+In other words, it is their first time with Home Credit and we are not able to find their ID in previous_app.
+
+When we do a left join (temp_processed on previous_app) we will get some NA values. There are no NA values in previous_app$NAME_CONTRACT_STATUS, so NA values of NAME_CONTRACT_STATUS after the resulting join will only mean that the client is new to Home Credit so a match could not be found with previous_app.
+
+When we bring this feature in the model, we will impute that 5.35% of rows that have NA for previous status.
+
+In current table, each row is a unique ID. There are no duplicates.
+
+However, there are duplicate SK_ID_CURR in the previous_app table. This means that some clients had multiple previous applications for loans from Home Credit.
+
+For instance, let's look at one client.
+
+
+```{r}
+
+sqldf("SELECT DAYS_DECISION, NAME_CONTRACT_STATUS
+       FROM previous_app
+       WHERE SK_ID_CURR == 100008
+       ORDER BY DAYS_DECISION")
+
+
+```
+
+
+For predicting default risk using NAME_CONTRACT_STATUS, we have some options.
+
+The first option is that we can only grab information about the LATEST loan application of the client in the previous_app table. We could choose to do this is because I am hypothesizing that the latest previous loan application status would be most indictative of the ability to repay on time or not.
+
+For instance, I believe that just because Home Credit refused to give a loan to a client 7 or 8 years ago
+does not mean that that client is in the present unable to repay loans on time and will default. People's financial status change over time, especially after many years.
+
+This is why looking at the most recent previous application status might be a better idea.
+
+Now, we have a possible issue with this option.
+
+What if we have a client in which there is only 1 previous loan application for him or her, and DAYS_DECISION (the time difference in days between current loan application and previous loan application) is very big so therefore the previous loan application was submitted several or many years ago?
+
+What if we have a client in which there are multiple previous loan applications for him or her but DAYS_DECISION are all very big? In other words, those applications were all submitted years before the current application.
+
+
+In both of these cases, if it is true that the status of applications years ago does not predict
+default risk well, then this feature might not be useful in predicting default risk.
+
+However, let's look at how many clients actually have their latest previous loan application decision made a long time ago.
+If there aren't that many of these clients, then it might be worth it to make this feature.
+
+
+I will define "a long time ago" as 5 years. Therefore, I am assuming that previous status of an application made more than 5 years ago from current application would not be indicative of repay ability of current loan.
+
+Since DAYS_DECISION is in days, let's convert 5 years to days. This is 5 * 365 = 1825.
+
+
+```{r}
+
+as.vector(unlist(sqldf("SELECT COUNT(*)
+      
+       FROM
+
+       (SELECT SK_ID_CURR, MAX(DAYS_DECISION) AS lastest_application
+       FROM previous_app
+       GROUP BY SK_ID_CURR
+       HAVING MAX(DAYS_DECISION) < -1825)"))) /  length(unique(previous_app$SK_ID_CURR))
+
+
+
+```
+
+This is good and probably won't affect the predictor that much. If my logic and reasoning is correct, the status/decision of the latest previous application could therefore be useful in predicting default disk.
+
+
+First, let's check to see what NAME_CONTRACT_STATUS contains.
+
+```{r}
+levels(previous_app$NAME_CONTRACT_STATUS)
+```
+
+
+We see that the status of the previous application was either that it was accepted, canceled, refused, or unused.
+
+For the purposes of building this model, I am going to group both "approved" and "unused offer" into just "approved".
+
+The justification for this is that an unused offer still indicates that the client was accepted for the loan. The only difference is that he or she chose to not go through with taking out the loan in the end.
+
+
+```{r}
+
+previous_app$NAME_CONTRACT_STATUS <- combineLevels(previous_app$NAME_CONTRACT_STATUS, 
+              
+              levs = c("Approved", "Unused offer"),
+              
+              newLabel = c("Approved"))
+
+
+```
+
+We check to make sure this worked properly, and indeed it did.
+
+
+```{r}
+levels(previous_app$NAME_CONTRACT_STATUS)
+```
+
+
+Now, we will identify the ranks of each previous application, grouped by the client (we will use SK_ID_CURR). This is the first step to retrieve the latest application for each client.
+
+```{r}
+
+library(data.table)
+previous_app$DAYS_DECISION <- -previous_app$DAYS_DECISION
+previous_ranked <- setDT(previous_app)[ , rank := rank(DAYS_DECISION), by = SK_ID_CURR]
+
+```
+
+Let's check to make sure this worked properly. We will use one ID as an example for a quick check.
+
+
+```{r}
+
+sqldf("SELECT SK_ID_CURR, DAYS_DECISION, NAME_CONTRACT_STATUS, rank
+       FROM previous_ranked
+       WHERE SK_ID_CURR == 100009
+       ORDER BY rank")
+
+```
+
+
+Now, we will just grab the ID, rank = 1 for each ID, as well as the status associated with rank = 1.
+
+
+
+```{r}
+
+previous_ranked <- sqldf('SELECT SK_ID_CURR, NAME_CONTRACT_STATUS
+                          FROM previous_ranked
+                          WHERE rank = 1')
+
+head(previous_ranked, 10)
+
+```
+
+Now, we will join our current table (temp_processed) with previous_ranked. This will give us the previous application status for each client along with all the current application information. Then we can proceed to adding it in the model.
+
+
+```{r}
+
+temp_processed2 <- sqldf("SELECT current.*, previous.NAME_CONTRACT_STATUS
+                          FROM temp_processed AS current
+                          LEFT JOIN previous_ranked AS previous
+                          ON current.SK_ID_CURR = previous.SK_ID_CURR")
+head(temp_processed2,10)
+
+```
+
+Before we begin with reconstructing our model based on the new data, let's examine the default rate for each previous application status.
+
+
+```{r}
+
+names(temp_processed2)[names(temp_processed2) == 'NAME_CONTRACT_STATUS'] <- 'PREVIOUS_APP_STATUS'
+
+
+sqldf("SELECT PREVIOUS_APP_STATUS, AVG(TARGET) AS default_rate
+       FROM temp_processed2
+       GROUP BY PREVIOUS_APP_STATUS
+       ORDER BY AVG(TARGET)")
+
+
+```
+
+
+The results are not that surprising. Those who had their latest previous application approved tend to have a lower default rate. This is because there is evidence that the person could be financially capable of paying back their loans on time.
+
+Those who got a rejection from their latest previous loan application are more likely to default (6.29% more).
+
+Now, let's rebuild our model.
+
+```{r}
+
+temp_processed2$PREVIOUS_APP_STATUS <- as.factor(temp_processed2$PREVIOUS_APP_STATUS)
+
+```
+
+```{r}
+require(caTools)
+
+temp_processed2$NAME_TYPE_SUITE <- as.factor(temp_processed2$NAME_TYPE_SUITE)
+temp_processed2$OCCUPATION_TYPE <- as.factor(temp_processed2$OCCUPATION_TYPE)
+temp_processed2$EMERGENCYSTATE_MODE <- as.factor(temp_processed2$EMERGENCYSTATE_MODE)
+temp_processed2$AMT_REQ_CREDIT_BUREAU_HOUR <- as.factor(temp_processed2$AMT_REQ_CREDIT_BUREAU_HOUR)
+temp_processed2$Number_of_Children <- as.factor(temp_processed2$Number_of_Children)
+temp_processed2$Number_of_Family_Members <- as.factor(temp_processed2$Number_of_Family_Members)
+
+
+set.seed(7720489)
+
+random_rows <- sample(nrow(temp_processed2), 3000)
+
+temp_processed_subset <- temp_processed2[random_rows, ]
+
+temp_processed_subset$SK_ID_CURR <- NULL #this is not a predictor. it is just an ID.
+
+temp_processed_subset$AMT_ANNUITY <- NULL #age of repay includes this predictor already
+
+temp_processed_subset$AMT_CREDIT <- NULL #age of repay includes this predictor already
+
+temp_processed_subset$EXT_SOURCE_2 <- NULL #we don't know how to interpret this column
+
+temp_processed_subset$EXT_SOURCE_3 <- NULL #we don't know how to interpret this column
+
+sample <- sample.split(temp_processed_subset, SplitRatio = 0.8) 
+
+temp_processed_subset.train <- subset(temp_processed_subset,sample == TRUE)
+
+temp_processed_subset.test <- subset(temp_processed_subset, sample == FALSE)
+
+set.seed(7720489)
+
+mybag <- randomForest(TARGET ~ ., data = temp_processed_subset.train, na.action = na.roughfix, importance = TRUE)
+
+predicted_stuff <- predict(mybag, newdata = temp_processed_subset.test) 
+
+table(predicted = predicted_stuff, actual = temp_processed_subset.test$TARGET)
+
+#Get importance of features with Gini Index 
+imp <- as.data.frame(importance(mybag))
+imp["feature"] <- rownames(imp)
+imp <- imp[,c("feature","MeanDecreaseGini")]
+sqldf::sqldf("SELECT * FROM imp ORDER BY MeanDecreaseGini DESC")
+
+
+```
+
+The test error of the random forest model with the extra predictor of latest previous application status actually is larger than the model without it. The test error in this case is 12.676%.
+
+However, it could be that this predictor actually improves our model but by chance the test error for the randomly selected training and test sets is much higher than usual.
+
+Therefore, I have decided to examine the average test error (along with its distribution) of the new model by using 50 different randomly selected seeds to generate different data.
+
+Then, I will use a t-test to see if there is a significant difference in the average test error rates of the 2 models. If the average test error rate of the new model is significantly lower, then I will consider the new predictor as useful.
+
+
+```{r}
+
+require(caTools)
+
+set.seed(100)
+
+random_seeds <- sample(seq(1,1000000000), 50)
+
+error_rates2 <- rep(NA, length(random_seeds))
+
+
+for(i in 1:length(random_seeds)){
+
+set.seed(random_seeds[i])
+  
+random_rows <- sample(nrow(temp_processed2), 3000)
+
+temp_processed_subset <- temp_processed2[random_rows, ]
+
+temp_processed_subset$SK_ID_CURR <- NULL #this is not a predictor. it is just an ID.
+
+temp_processed_subset$AMT_ANNUITY <- NULL #age of repay includes this predictor already
+
+temp_processed_subset$AMT_CREDIT <- NULL #age of repay includes this predictor already
+
+temp_processed_subset$EXT_SOURCE_2 <- NULL #we don't know how to interpret this column
+
+temp_processed_subset$EXT_SOURCE_3 <- NULL #we don't know how to interpret this column
+
+set.seed(random_seeds[i])
+
+sample <- sample.split(temp_processed_subset, SplitRatio = 0.8) 
+
+temp_processed_subset.train <- subset(temp_processed_subset,sample == TRUE)
+
+temp_processed_subset.test <- subset(temp_processed_subset, sample == FALSE)
+
+set.seed(random_seeds[i])
+
+mybag <- randomForest(TARGET ~ ., data = temp_processed_subset.train, na.action = na.roughfix, importance = TRUE)
+
+predicted_stuff <- predict(mybag, newdata = temp_processed_subset.test) 
+
+error_rates2[i] <- (table(predicted = predicted_stuff, actual = temp_processed_subset.test$TARGET)[2] + table(predicted = predicted_stuff, actual = temp_processed_subset.test$TARGET)[3]) / (table(predicted = predicted_stuff, actual = temp_processed_subset.test$TARGET)[1] + table(predicted = predicted_stuff, actual = temp_processed_subset.test$TARGET)[4] + table(predicted = predicted_stuff, actual = temp_processed_subset.test$TARGET)[2] + table(predicted = predicted_stuff, actual = temp_processed_subset.test$TARGET)[3])
+
+
+}
+
+summary(error_rates2)
+sd(error_rates2)
+
+hist(error_rates2, main = "Misclassification Rate Distribution", col = "red")
+
+
+```
+
+
+The result is that the average test error rate for the new model is 6.720%. When we observe the histogram showing the distribution of test error rates of our new model, we notice that our test error rate of 12.67% using that one random seed is actually very unlikely to occur. Therefore, the decision to observe how the model behaves when lots of different data is fed to it was a good idea.
+
+
+```{r}
+
+t.test(error_rates2, error_rates, alternative = "less", var.equal = FALSE)
+
+```
+
+Last but not least, we find that the average test error rate of the new model is significantly lower!
+
+
+#Clustering to Find Different Types of Clients
+
+
+```{r}
+
+temp_processed2_x <- temp_processed2[,-2]
+head(temp_processed2_x)
+
+```
+
+K-means clustering will not work when there are NA's present in the data. We need to start by imputing NA's using the mice package in R. Unfortunately, the mice package will not run on huge data, so we are forced to take a random sample. I chose 500 random rows which is rather small, but the advanage of this is that I can increase the number of iterations of the mice algorithm to make sure that convergence is present (we check it down below).
+
+
+I have decided to use the "cart" method in R for the mice algorithm. The reason is that we have some columns that are a linear combination of one or more columns in the data. We know this because for instance, I created the age of repay column which is a combination of some other predictors. By default, the imputation algorithms utilize linear regression so we will have data that cannot be inverted (uninvertible X).
+
+The "cart" method does not try to invert X so we won't get an error.
+
+
+```{r}
+library(mice)
+
+set.seed(100)
+
+select_rows <- sample(nrow(temp_processed2_x), 500)
+
+temp_processed2_x_subset <- temp_processed2_x[select_rows, ]
+
+nums <- unlist(lapply(temp_processed2_x_subset, is.numeric))  
+
+temp_processed2_x_subset <- temp_processed2_x_subset[ , nums]
+
+tempData <- mice(temp_processed2_x_subset, m = 7,maxit = 30, meth = 'cart', seed = 500)
+
+original <- mice::complete(tempData)
+
+original$YEARS_BEGINEXPLUATATION_MEDI <- NULL
+
+head(original)
+
+```
+
+
+
+```{r}
+
+tempData2 <- complete(tempData)[,-1] #removing ID, useless column
+
+head(tempData2)
+
+```
+
+
+```{r}
+plot(tempData)
+```
+
+We generally have convergence for almost all the predictors so I conclude that the mice algorithm did a good job.
+
+
+```{r}
+
+tempData2$YEARS_BEGINEXPLUATATION_MEDI <- NULL #this column wasnt able to be imputed
+
+```
+
+
+We will start by choosing the optimal K value.
+
+
+```{r}
+
+library(cluster)  
+library(factoextra) 
+
+set.seed(123)
+
+our_wss <- function(k) {
+  kmeans(tempData2, k, nstart = 10 )$tot.withinss
+}
+
+
+our_kvalues <- 1:15
+
+
+wss_val <- map_dbl(our_kvalues, our_wss)
+
+plot(our_kvalues, wss_val,
+       type="b", pch = 19, frame = FALSE, 
+       xlab="Selected K",
+       ylab="Total SS for within-clusters ")
+
+
+```
+
+
+We notice that K = 4 seems to be at the "elbow" of the graph. This means that we have low total SS and also we don't have a large number of clusters. We could create 10 or 12 clusters but we would lose some interpretibility. It is better to group clients into less clusters such as 4 and then use those 4 to explain default risk.
+
+
+```{r}
+
+set.seed(123)
+
+clustering <- kmeans(tempData2, 4 , nstart = 25)
+
+
+```
+
+
+
+```{r}
+
+final <- as.data.frame(cbind(original, clustering$cluster))
+
+names(final)[names(final) == 'clustering$cluster'] <- 'cluster'
+
+head(final)
+
+
+```
+
+```{r}
+
+temp_processed2_with_clusters <- sqldf('SELECT current.*, final.cluster
+                                        FROM temp_processed2 AS current
+                                        INNER JOIN final
+                                        ON current.SK_ID_CURR = final.SK_ID_CURR
+                                       ')
+
+
+```
+
+
+I will now run random forest on the new data with the extra predictor called 'cluster' and I will compute the test error to see if the model performs better. I have also chosen to subset to 51 predictors (the 51 best predictors according to the mean decrease in Gini, which still includes the 2 recent predictors I have added which are previous app status and cluster). I got these 51 predictors by running random forest on all predictors and simply choosing the top 51.
+
+```{r}
+
+temp_processed2_with_clusters$NAME_TYPE_SUITE <- as.factor(temp_processed2_with_clusters$NAME_TYPE_SUITE)
+temp_processed2_with_clusters$OCCUPATION_TYPE <- as.factor(temp_processed2_with_clusters$OCCUPATION_TYPE)
+temp_processed2_with_clusters$EMERGENCYSTATE_MODE <- as.factor(temp_processed2_with_clusters$EMERGENCYSTATE_MODE)
+temp_processed2_with_clusters$AMT_REQ_CREDIT_BUREAU_HOUR <- as.factor(temp_processed2_with_clusters$AMT_REQ_CREDIT_BUREAU_HOUR)
+temp_processed2_with_clusters$Number_of_Children <- as.factor(temp_processed2_with_clusters$Number_of_Children)
+temp_processed2_with_clusters$Number_of_Family_Members <- as.factor(temp_processed2_with_clusters$Number_of_Family_Members)
+
+temp_processed2_with_clusters$PREVIOUS_APP_STATUS <- as.factor(temp_processed2_with_clusters$PREVIOUS_APP_STATUS)
+temp_processed2_with_clusters$cluster <- as.factor(temp_processed2_with_clusters$cluster)
+
+
+set.seed(100)
+
+random_seeds <- sample(seq(1,1000000000), 50)
+
+error_rates4 <- rep(NA, length(random_seeds))
+
+
+for(i in 1:length(random_seeds)){
+
+set.seed(random_seeds[i])
+
+
+temp_processed2_with_clusters$SK_ID_CURR <- NULL #this is not a predictor. it is just an ID.
+
+temp_processed2_with_clusters$AMT_ANNUITY <- NULL #age of repay includes this predictor already
+
+temp_processed2_with_clusters$AMT_CREDIT <- NULL #age of repay includes this predictor already
+
+temp_processed2_with_clusters$EXT_SOURCE_2 <- NULL #we don't know how to interpret this column
+
+temp_processed2_with_clusters$EXT_SOURCE_3 <- NULL #we don't know how to interpret this column
+
+set.seed(random_seeds[i])
+
+sample <- sample.split(temp_processed2_with_clusters, SplitRatio = 0.8) 
+
+temp_processed_subset.train <- subset(temp_processed2_with_clusters,sample == TRUE)
+
+temp_processed_subset.test <- subset(temp_processed2_with_clusters, sample == FALSE)
+
+set.seed(random_seeds[i])
+
+mybag <- randomForest(TARGET ~ ORGANIZATION_TYPE + OCCUPATION_TYPE + DAYS_ID_PUBLISH + age_repay_estimate + DAYS_REGISTRATION + WEEKDAY_APPR_PROCESS_START + DAYS_BIRTH + HOUR_APPR_PROCESS_START + DAYS_LAST_PHONE_CHANGE + AMT_GOODS_PRICE + DAYS_EMPLOYED + REGION_POPULATION_RELATIVE + AMT_REQ_CREDIT_BUREAU_YEAR + YEARS_BEGINEXPLUATATION_MODE + YEARS_BEGINEXPLUATATION_MEDI + AMT_INCOME_TOTAL + TOTALAREA_MODE + YEARS_BEGINEXPLUATATION_AVG + AMT_REQ_CREDIT_BUREAU_QRT + cluster + DEF_60_CNT_SOCIAL_CIRCLE + OBS_60_CNT_SOCIAL_CIRCLE + Number_of_Children + OBS_30_CNT_SOCIAL_CIRCLE + DEF_30_CNT_SOCIAL_CIRCLE + NAME_FAMILY_STATUS + NAME_INCOME_TYPE + REGION_RATING_CLIENT_W_CITY + REGION_RATING_CLIENT + FLOORSMAX_AVG  +  AMT_REQ_CREDIT_BUREAU_HOUR + FLOORSMAX_MODE + REG_CITY_NOT_LIVE_CITY + FLOORSMAX_MEDI + NAME_TYPE_SUITE + CODE_GENDER + FLAG_DOCUMENT_8 + FLAG_PHONE + REG_CITY_NOT_WORK_CITY + FLAG_WORK_PHONE + FLAG_OWN_CAR + LIVE_CITY_NOT_WORK_CITY + FLAG_OWN_REALTY + Number_of_Family_Members  + FLAG_DOCUMENT_3 + AMT_REQ_CREDIT_BUREAU_MON + FLAG_EMP_PHONE + NAME_EDUCATION_TYPE + AMT_REQ_CREDIT_BUREAU_WEEK + FLAG_EMAIL + PREVIOUS_APP_STATUS, data = temp_processed_subset.train, na.action = na.roughfix, importance = TRUE)
+
+predicted_stuff <- predict(mybag, newdata = temp_processed_subset.test) 
+
+error_rates4[i] <- (table(predicted = predicted_stuff, actual = temp_processed_subset.test$TARGET)[2] + table(predicted = predicted_stuff, actual = temp_processed_subset.test$TARGET)[3]) / (table(predicted = predicted_stuff, actual = temp_processed_subset.test$TARGET)[1] + table(predicted = predicted_stuff, actual = temp_processed_subset.test$TARGET)[4] + table(predicted = predicted_stuff, actual = temp_processed_subset.test$TARGET)[2] + table(predicted = predicted_stuff, actual = temp_processed_subset.test$TARGET)[3])
+
+
+
+}
+
+summary(error_rates4)
+sd(error_rates4)
+
+hist(error_rates4, main = "Misclassification Rate Distribution", col = "red")
+
+#Get importance of features with Gini Index 
+imp <- as.data.frame(importance(mybag))
+imp["feature"] <- rownames(imp)
+imp <- imp[,c("feature","MeanDecreaseGini")]
+sqldf::sqldf("SELECT * FROM imp ORDER BY MeanDecreaseGini DESC")
+
+
+
+
+
+```
+
+
+#Limitations
+
+
+So, our final model is a random forest model with 51 predictors. We managed to reduce the number of predictors by quite a bit, and mean test error actually remained the same (being 4.9965%). This means we can explain default risk but with much less predictors which is definately better.
+
+A highlight of some of the 51 predictors is:
+
+occupation type of the client organization that the client works for age that the person is expected to completely repay the loan (I created this earlier) how old the person is (DAYS_BIRTH) how many days before the application the client changed his or her phone number how densely populated the city in which the client lives in is (REGION_POPULATION_RELATIVE) how many days before the application the person started current employment income of the client cluster that we created number of children the client has gender of the client whether the client owns a flat or house whether client provided a home phone number number of family members the client has previous app status
+
+Of course, there are many more, but I have chosen just to describe some of the columns which are bit more easily interpretable and interesting. If you are curious about looking at the description of all the columns, you can refer to the columns_description dataset.
+
+#Conclusions
+
+So, our final model is a random forest model with 51 predictors. We managed to reduce the number of predictors by quite a bit. This means we can explain default risk but with much less predictors which is definately better.
+
+
+A highlight of some of the 51 predictors is:
+
+occupation type of the client
+organization that the client works for
+age that the person is expected to completely repay the loan (I created this earlier)
+how old the person is (DAYS_BIRTH)
+how many days before the application the client changed his or her phone number
+how densely populated the city in which the client lives in is (REGION_POPULATION_RELATIVE)
+how many days before the application the person started current employment
+income of the client
+cluster that we created
+number of children the client has
+gender of the client
+whether the client owns a flat or house
+whether client provided a home phone number
+number of family members the client has
+previous app status
+
+
+Of course, there are many more, but I have chosen just to describe some of the columns which are bit more easily interpretable and interesting. If you are curious about looking at the description of all the columns, you can refer to the columns_description dataset.
+
+
+
+#Literature Review
+
+
+Some models found balance of the loan (loan amount) to be useful in predicting credit default risk. One in particular found it to be the most useful predictor and he or she also used random forest for this. This coincides with our findings since the amount of the loan was found to be quite significant in the final model. He or she also found loan duration to be significant to some degree when we look at the visualization. Our predictor which is the expected age of repay takes into account the duration of the loan. Essentially, it is a linear combination of the loan duration, and this predictor was found to be useful in our model. Therefore, our findings are similar. Even though this person's model was made on different data, it still provides some good insight.
+
+Another person found balance to be a useful predictor as well.
+
+You can view it here: https://medium.com/henry-jia/bank-loan-default-prediction-with-machine-learning-e9336d19dffa
+
+Also here: https://towardsdatascience.com/predicting-loan-repayment-5df4e0023e92
+
+
+
+
+
+
+
